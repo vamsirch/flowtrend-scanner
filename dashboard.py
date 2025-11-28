@@ -16,7 +16,7 @@ st.title("🐋 FlowTrend Pro Terminal")
 @st.cache_resource
 class StreamState:
     def __init__(self):
-        self.data = deque(maxlen=200) # Keep last 200 trades
+        self.data = deque(maxlen=1000) # Increased limit to hold more historical data
         self.running = False
         self.thread = None
 
@@ -30,70 +30,70 @@ with st.sidebar:
     st.divider()
     
     st.header("📡 Scanner Config")
+    # The Mag 7 List
     default_tickers = ["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ", "AMZN", "MSFT", "META", "GOOGL"]
     tickers = st.multiselect("Watchlist", default_tickers, default=["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ"])
     
-    # Lower default threshold to ensure you see data immediately for testing
-    min_flow = st.number_input("Min Whale Premium ($)", value=25_000, step=5_000)
+    # Lowered default to $5k to ensure you see data even on slow days
+    min_flow = st.number_input("Min Dollar Amount ($)", value=5_000, step=5_000)
     
     col1, col2 = st.columns(2)
     start_btn = col1.button("🟢 Start Feed")
     stop_btn = col2.button("🔴 Stop Feed")
 
-# --- FIXED BACKFILL FUNCTION ---
+# --- BACKFILL FUNCTION (The Fix) ---
 def run_backfill(key, watchlist, threshold):
-    """Fetches Today's Top Volume contracts so the table isn't empty on start."""
-    try:
-        client = RESTClient(key)
-        count = 0
-        
-        # Create a progress bar in the sidebar so you know it's working
-        prog_text = st.sidebar.empty()
-        prog_bar = st.sidebar.progress(0)
-        
-        for i, t in enumerate(watchlist):
-            prog_text.text(f"Backfilling {t}...")
-            prog_bar.progress((i + 1) / len(watchlist))
+    """Fetches the Day's Summary for all existing contracts."""
+    client = RESTClient(key)
+    count = 0
+    
+    # Status Container to show progress
+    status = st.status("⏳ Downloading today's trade data...", expanded=True)
+    
+    for t in watchlist:
+        try:
+            status.write(f"📥 Fetching Top 50 Contracts for **{t}**...")
             
-            try:
-                # CRITICAL FIX: Sort by 'day_volume' desc to get the REAL whales
-                chain = client.list_snapshot_options_chain(
-                    t, 
-                    params={"limit": 30, "sort": "day_volume", "order": "desc"}
-                )
-                
-                for c in chain:
-                    # Validate data exists
-                    if c.day and c.day.volume and c.day.close:
-                        flow = c.day.close * c.day.volume * 100
+            # Get the 50 most active contracts for this stock today
+            chain = client.list_snapshot_options_chain(
+                t, 
+                params={"limit": 50, "sort": "day_volume", "order": "desc"}
+            )
+            
+            ticker_count = 0
+            for c in chain:
+                # Ensure data exists
+                if c.day and c.day.volume and c.day.close:
+                    # Calculate Dollar Amount
+                    premium = c.day.close * c.day.volume * 100
+                    
+                    if premium >= threshold:
+                        side = "CALL" if c.details.contract_type == "call" else "PUT"
                         
-                        if flow >= threshold:
-                            side = "CALL" if c.details.contract_type == "call" else "PUT"
-                            
-                            # Add to state
-                            state.data.append({
-                                "Time": "Today (Sum)", # Mark as Day Summary
-                                "Ticker": t,
-                                "Tags": "📊 DAY TOP", # Different tag for backfill
-                                "Side": side,
-                                "Price": c.day.close,
-                                "Size": c.day.volume,
-                                "Flow": flow,
-                                "Symbol": c.details.ticker
-                            })
-                            count += 1
-            except Exception as e:
-                print(f"Skipping {t}: {e}")
-                continue
-        
-        prog_text.empty()
-        prog_bar.empty()
-        return count
-    except Exception as e:
-        st.error(f"Backfill error: {e}")
-        return 0
+                        # Add to our list
+                        state.data.append({
+                            "Symbol": t,                   # Stock Symbol
+                            "Strike": c.details.strike_price, # Strike Price
+                            "Side": side,                  # Call or Put
+                            "Volume": c.day.volume,        # Contract Volume
+                            "Value": premium,              # Dollar Amount
+                            "Time": "Day Sum",             # Time label
+                            "Tags": "📊 HISTORICAL"
+                        })
+                        count += 1
+                        ticker_count += 1
+            
+            # Debug output
+            status.write(f"✅ Found {ticker_count} whales for {t}")
+            
+        except Exception as e:
+            status.warning(f"Failed to fetch {t}: {e}")
+            continue
+            
+    status.update(label=f"Download Complete! Loaded {count} trades.", state="complete", expanded=False)
+    return count
 
-# --- WEBSOCKET THREAD ---
+# --- WEBSOCKET THREAD (Live Stream) ---
 def run_websocket(key, watchlist, threshold):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -115,42 +115,35 @@ def run_websocket(key, watchlist, threshold):
                         # SWEEP DETECTION
                         conditions = m.conditions if hasattr(m, 'conditions') and m.conditions else []
                         is_sweep = 14 in conditions
-                        tags = "🧹 SWEEP" if is_sweep else "🧱 BLOCK"
+                        tags = "🧹 SWEEP" if is_sweep else "⚡ LIVE"
                         
                         state.data.appendleft({
-                            "Time": time.strftime("%H:%M:%S"),
-                            "Ticker": found_ticker,
-                            "Tags": tags,
+                            "Symbol": found_ticker,
+                            "Strike": "N/A", # Websocket doesn't send strike easily, we'd need to parse symbol
                             "Side": side,
-                            "Price": m.price,
-                            "Size": m.size,
-                            "Flow": flow,
-                            "Symbol": m.symbol
+                            "Volume": m.size,
+                            "Value": flow,
+                            "Time": time.strftime("%H:%M:%S"),
+                            "Tags": tags
                         })
                 except: continue
 
     client = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
     client.run(handle_msg)
 
-# --- START/STOP LOGIC ---
+# --- START BUTTON LOGIC ---
 if start_btn:
     if not api_key:
         st.error("Please enter API Key.")
-    elif not state.running:
-        # 1. Run Backfill First (With Spinner)
-        with st.spinner("⏳ Loading today's top whale activity..."):
-            hits = run_backfill(api_key, tickers, min_flow)
-            
-        if hits > 0:
-            st.toast(f"Backfill loaded {hits} whale contracts!", icon="✅")
-        else:
-            st.toast("Backfill found no trades > threshold.", icon="⚠️")
+    else:
+        # 1. RUN BACKFILL (This populates the table instantly)
+        run_backfill(api_key, tickers, min_flow)
         
-        # 2. Start Thread
-        state.running = True
-        state.thread = threading.Thread(target=run_websocket, args=(api_key, tickers, min_flow), daemon=True)
-        state.thread.start()
-        st.success("Live Scanner Active! Listening for new Sweeps...")
+        # 2. START LISTENER (For new trades if market is open)
+        if not state.running:
+            state.running = True
+            state.thread = threading.Thread(target=run_websocket, args=(api_key, tickers, min_flow), daemon=True)
+            state.thread.start()
 
 if stop_btn:
     state.running = False
@@ -168,11 +161,9 @@ with tab1:
     else:
         client = RESTClient(api_key)
         c1, c2 = st.columns([1, 3])
-        
         with c1:
             st.subheader("1. Setup")
             target_ticker = st.selectbox("Select Asset", tickers) 
-            
             try:
                 snap = client.get_snapshot_ticker("stocks", target_ticker)
                 cur_price = snap.last_trade.price if snap.last_trade else snap.day.close
@@ -182,9 +173,7 @@ with tab1:
             
             expiry = st.date_input("Expiration", value=datetime.now().date())
             otype = st.radio("Side", ["Call", "Put"], horizontal=True)
-            
             st.write("---")
-            
             try:
                 contracts = client.list_options_contracts(
                     underlying_ticker=target_ticker,
@@ -193,21 +182,17 @@ with tab1:
                     limit=1000
                 )
                 valid_strikes = sorted(list(set([c.strike_price for c in contracts])))
-                
                 if valid_strikes:
                     def_ix = min(range(len(valid_strikes)), key=lambda i: abs(valid_strikes[i]-cur_price)) if cur_price > 0 else 0
                     strike = st.selectbox("Strike Price", valid_strikes, index=def_ix)
-                    
                     d_str = expiry.strftime("%y%m%d")
                     t_char = "C" if otype == "Call" else "P"
                     s_str = f"{int(strike*1000):08d}"
                     final_symbol = f"O:{target_ticker}{d_str}{t_char}{s_str}"
-                    
                     if st.button("Analyze Contract", type="primary"):
                         st.session_state['active_sym'] = final_symbol
                 else:
-                    st.error(f"No strikes found for {target_ticker} on {expiry}.")
-            
+                    st.error(f"No strikes found.")
             except Exception as e:
                 st.error(f"API Error: {e}")
 
@@ -225,7 +210,6 @@ with tab1:
                         if osnap.greeks:
                             m2.metric("Delta", f"{osnap.greeks.delta:.2f}")
                             m3.metric("Gamma", f"{osnap.greeks.gamma:.2f}")
-                        
                         st.write("### ⚡ Intraday Chart (5-Min)")
                         today = datetime.now().strftime("%Y-%m-%d")
                         aggs = client.get_aggs(sym, 5, "minute", today, today)
@@ -238,28 +222,27 @@ with tab1:
                 except Exception as e:
                     st.error(f"Data Load Error: {e}")
 
-# --- TAB 2: LIVE STREAM ---
+# --- TAB 2: LIVE STREAM (The Fix) ---
 with tab2:
     st.subheader("🔥 Live Flow: Sweeps & Blocks")
     
     feed_placeholder = st.empty()
     
+    # Custom Styling for the Table
     def style_df(df):
         def color_rows(row):
             c = '#d4f7d4' if row['Side'] == 'CALL' else '#f7d4d4'
-            if "SWEEP" in row['Tags']:
-                return [f'background-color: {c}; font-weight: bold; border-left: 5px solid #ffcc00'] * len(row)
-            if "DAY TOP" in row['Tags']:
-                return [f'background-color: {c}; opacity: 0.8'] * len(row)
             return [f'background-color: {c}; color: black'] * len(row)
-        return df.style.apply(color_rows, axis=1).format({"Flow": "${:,.0f}", "Price": "${:.2f}"})
+        return df.style.apply(color_rows, axis=1).format({"Value": "${:,.0f}"})
 
+    # Render Table
     if state.running or len(state.data) > 0:
         if len(state.data) > 0:
             df = pd.DataFrame(list(state.data))
             
-            # Sort so newest (or biggest backfill) is top
-            # We sort by Time (descending) roughly, or just display as is (deque is already sorted by insert)
+            # Sort by Time (Newest First) or Value? 
+            # Usually for a feed, we want Newest first, but for backfill summary, maybe Value.
+            # Let's just show as is (Deque handles order).
             
             with feed_placeholder.container():
                 st.dataframe(
@@ -267,7 +250,8 @@ with tab2:
                     use_container_width=True, 
                     height=800,
                     column_config={
-                        "Flow": st.column_config.ProgressColumn("Premium", format="$%f", min_value=0, max_value=max(df["Flow"].max(), 100_000)),
+                        "Value": st.column_config.ProgressColumn("Dollar Amount", format="$%f", min_value=0, max_value=max(df["Value"].max(), 100_000)),
+                        "Volume": st.column_config.NumberColumn("Contract Vol", format="%d"),
                         "Tags": st.column_config.TextColumn("Type", help="🧹 = Aggressive Sweep"),
                     },
                     hide_index=True
@@ -276,4 +260,5 @@ with tab2:
             time.sleep(1)
             st.rerun()
     else:
-        st.info("Click 'Start Feed' in the sidebar to load Backfill & Live Data.")
+        st.info("Click 'Start Feed' in the sidebar to load Data.")
+
