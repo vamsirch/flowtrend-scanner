@@ -127,5 +127,153 @@ def run_websocket(key, watchlist, threshold):
                             "Flow": flow,
                             "Symbol": m.symbol
                         })
+                except: continue
 
+    client = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
+    client.run(handle_msg)
 
+# --- START/STOP LOGIC ---
+if start_btn:
+    if not api_key:
+        st.error("Please enter API Key.")
+    elif not state.running:
+        # 1. Run Backfill First (With Spinner)
+        with st.spinner("⏳ Loading today's top whale activity..."):
+            hits = run_backfill(api_key, tickers, min_flow)
+            
+        if hits > 0:
+            st.toast(f"Backfill loaded {hits} whale contracts!", icon="✅")
+        else:
+            st.toast("Backfill found no trades > threshold.", icon="⚠️")
+        
+        # 2. Start Thread
+        state.running = True
+        state.thread = threading.Thread(target=run_websocket, args=(api_key, tickers, min_flow), daemon=True)
+        state.thread.start()
+        st.success("Live Scanner Active! Listening for new Sweeps...")
+
+if stop_btn:
+    state.running = False
+    st.warning("Scanner Paused.")
+
+# ==================================================
+# TABS INTERFACE
+# ==================================================
+tab1, tab2 = st.tabs(["🔍 Contract Inspector", "⚡ Live Whale Stream"])
+
+# --- TAB 1: INSPECTOR ---
+with tab1:
+    if not api_key:
+        st.warning("Enter API Key to use.")
+    else:
+        client = RESTClient(api_key)
+        c1, c2 = st.columns([1, 3])
+        
+        with c1:
+            st.subheader("1. Setup")
+            target_ticker = st.selectbox("Select Asset", tickers) 
+            
+            try:
+                snap = client.get_snapshot_ticker("stocks", target_ticker)
+                cur_price = snap.last_trade.price if snap.last_trade else snap.day.close
+                st.info(f"📍 {target_ticker}: ${cur_price:.2f}")
+            except:
+                cur_price = 0
+            
+            expiry = st.date_input("Expiration", value=datetime.now().date())
+            otype = st.radio("Side", ["Call", "Put"], horizontal=True)
+            
+            st.write("---")
+            
+            try:
+                contracts = client.list_options_contracts(
+                    underlying_ticker=target_ticker,
+                    expiration_date=expiry.strftime("%Y-%m-%d"),
+                    contract_type="call" if otype == "Call" else "put",
+                    limit=1000
+                )
+                valid_strikes = sorted(list(set([c.strike_price for c in contracts])))
+                
+                if valid_strikes:
+                    def_ix = min(range(len(valid_strikes)), key=lambda i: abs(valid_strikes[i]-cur_price)) if cur_price > 0 else 0
+                    strike = st.selectbox("Strike Price", valid_strikes, index=def_ix)
+                    
+                    d_str = expiry.strftime("%y%m%d")
+                    t_char = "C" if otype == "Call" else "P"
+                    s_str = f"{int(strike*1000):08d}"
+                    final_symbol = f"O:{target_ticker}{d_str}{t_char}{s_str}"
+                    
+                    if st.button("Analyze Contract", type="primary"):
+                        st.session_state['active_sym'] = final_symbol
+                else:
+                    st.error(f"No strikes found for {target_ticker} on {expiry}.")
+            
+            except Exception as e:
+                st.error(f"API Error: {e}")
+
+        with c2:
+            if 'active_sym' in st.session_state:
+                sym = st.session_state['active_sym']
+                st.subheader(f"Analysis: {sym}")
+                try:
+                    osnap = client.get_snapshot_option(target_ticker, sym)
+                    if osnap:
+                        m1, m2, m3, m4 = st.columns(4)
+                        op = osnap.last_trade.price if osnap.last_trade else (osnap.day.close if osnap.day else 0)
+                        ov = osnap.day.volume if osnap.day else 0
+                        m1.metric("💰 Price", f"${op}", f"Vol: {ov}")
+                        if osnap.greeks:
+                            m2.metric("Delta", f"{osnap.greeks.delta:.2f}")
+                            m3.metric("Gamma", f"{osnap.greeks.gamma:.2f}")
+                        
+                        st.write("### ⚡ Intraday Chart (5-Min)")
+                        today = datetime.now().strftime("%Y-%m-%d")
+                        aggs = client.get_aggs(sym, 5, "minute", today, today)
+                        if aggs:
+                            df = pd.DataFrame(aggs)
+                            df['Time'] = pd.to_datetime(df['timestamp'], unit='ms')
+                            st.area_chart(df.set_index('Time')['close'], color="#00FF00")
+                        else:
+                            st.info("No trades yet today.")
+                except Exception as e:
+                    st.error(f"Data Load Error: {e}")
+
+# --- TAB 2: LIVE STREAM ---
+with tab2:
+    st.subheader("🔥 Live Flow: Sweeps & Blocks")
+    
+    feed_placeholder = st.empty()
+    
+    def style_df(df):
+        def color_rows(row):
+            c = '#d4f7d4' if row['Side'] == 'CALL' else '#f7d4d4'
+            if "SWEEP" in row['Tags']:
+                return [f'background-color: {c}; font-weight: bold; border-left: 5px solid #ffcc00'] * len(row)
+            if "DAY TOP" in row['Tags']:
+                return [f'background-color: {c}; opacity: 0.8'] * len(row)
+            return [f'background-color: {c}; color: black'] * len(row)
+        return df.style.apply(color_rows, axis=1).format({"Flow": "${:,.0f}", "Price": "${:.2f}"})
+
+    if state.running or len(state.data) > 0:
+        if len(state.data) > 0:
+            df = pd.DataFrame(list(state.data))
+            
+            # Sort so newest (or biggest backfill) is top
+            # We sort by Time (descending) roughly, or just display as is (deque is already sorted by insert)
+            
+            with feed_placeholder.container():
+                st.dataframe(
+                    style_df(df), 
+                    use_container_width=True, 
+                    height=800,
+                    column_config={
+                        "Flow": st.column_config.ProgressColumn("Premium", format="$%f", min_value=0, max_value=max(df["Flow"].max(), 100_000)),
+                        "Tags": st.column_config.TextColumn("Type", help="🧹 = Aggressive Sweep"),
+                    },
+                    hide_index=True
+                )
+        if state.running:
+            time.sleep(1)
+            st.rerun()
+    else:
+        st.info("Click 'Start Feed' in the sidebar to load Backfill & Live Data.")
