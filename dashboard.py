@@ -1,199 +1,223 @@
 import streamlit as st
-from polygon import RESTClient
-from datetime import datetime, timedelta
 import pandas as pd
+from polygon import RESTClient, WebSocketClient
+from polygon.websocket.models import WebSocketMessage
+import threading
 import time
+import asyncio
+from datetime import datetime, timedelta
+from collections import deque
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Mag 7 Options Command Center", layout="wide")
-st.title("💎 Mag 7 Options Command Center")
+st.set_page_config(page_title="FlowTrend Pro Terminal", layout="wide")
+st.title("🐋 FlowTrend Pro Terminal")
+st.caption("Institutional Grade Options Analysis & Real-Time Flow")
 
-# --- SIDEBAR: CONFIGURATION ---
-st.sidebar.header("Configuration")
-api_key = st.sidebar.text_input("Polygon API Key", type="password")
+# --- GLOBAL STATE (For Background Thread) ---
+@st.cache_resource
+class StreamState:
+    def __init__(self):
+        self.data = deque(maxlen=200) # Keep last 200 trades
+        self.running = False
+        self.thread = None
 
-# Define the Mag 7 Tickers
-MAG_7 = ["SPY", "QQQ", "NVDA", "TSLA", "AAPL", "AMD", "AMZN", "MSFT", "META", "GOOGL"]
+state = StreamState()
 
-if not api_key:
-    st.info("Please enter your API Key in the sidebar to unlock the dashboard.")
-    st.stop()
-
-client = RESTClient(api_key)
-
-# --- TABS LAYOUT ---
-tab1, tab2 = st.tabs(["🔍 Contract Inspector", "📡 Mag 7 Live Flow"])
-
-# ==========================================
-# TAB 1: CONTRACT INSPECTOR (Specific Data)
-# ==========================================
-with tab1:
-    col_config, col_main = st.columns([1, 3])
+# --- SIDEBAR: GLOBAL SETTINGS ---
+with st.sidebar:
+    st.header("🔐 Authentication")
+    api_key = st.text_input("Polygon API Key", type="password")
     
-    with col_config:
-        st.subheader("Select Contract")
-        
-        # 1. Asset Selection
-        ticker = st.selectbox("Ticker", MAG_7)
-        
-        # Auto-fetch price
-        try:
-            stock_snap = client.get_snapshot_ticker("stocks", ticker)
-            cur_price = stock_snap.last_trade.price
-            st.success(f"Current Price: ${cur_price}")
-        except:
-            cur_price = 0
-            st.warning("Connecting...")
-
-        # 2. Date Selection
-        default_date = datetime.now().date()
-        expiration = st.date_input("Expiration", value=default_date)
-        
-        # 3. Type Selection
-        option_type = st.radio("Side", ["Call", "Put"], horizontal=True)
-        type_code = "call" if option_type == "Call" else "put"
-
-        # 4. Smart Strike Picker
-        st.write("---")
-        try:
-            contracts = client.list_options_contracts(
-                underlying_ticker=ticker,
-                expiration_date=expiration.strftime("%Y-%m-%d"),
-                contract_type=type_code,
-                limit=1000
-            )
-            valid_strikes = sorted(list(set([c.strike_price for c in contracts])))
-            
-            if valid_strikes:
-                default_ix = min(range(len(valid_strikes)), key=lambda i: abs(valid_strikes[i]-cur_price)) if cur_price > 0 else 0
-                selected_strike = st.selectbox("Strike Price", valid_strikes, index=default_ix)
-                
-                # Build Symbol
-                date_str = expiration.strftime("%y%m%d")
-                type_char = "C" if option_type == "Call" else "P"
-                strike_str = f"{int(selected_strike*1000):08d}"
-                contract_symbol = f"O:{ticker}{date_str}{type_char}{strike_str}"
-                
-                if st.button("Analyze Contract", type="primary"):
-                    st.session_state['symbol_to_analyze'] = contract_symbol
-            else:
-                st.error("No strikes found for date.")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-    with col_main:
-        if 'symbol_to_analyze' in st.session_state:
-            sym = st.session_state['symbol_to_analyze']
-            st.subheader(f"Analysis: {sym}")
-            
-            try:
-                snapshot = client.get_snapshot_option(ticker, sym)
-                if snapshot:
-                    # Metrics
-                    m1, m2, m3, m4 = st.columns(4)
-                    
-                    # Price Logic
-                    if snapshot.last_trade:
-                        price = snapshot.last_trade.price
-                        vol = snapshot.last_trade.size
-                    elif snapshot.day:
-                        price = snapshot.day.close
-                        vol = snapshot.day.volume
-                    else:
-                        price = 0
-                    
-                    m1.metric("💰 Premium", f"${price}", f"Vol: {vol}")
-                    m2.metric("Bid / Ask", f"${snapshot.last_quote.bid_price} / ${snapshot.last_quote.ask_price}" if snapshot.last_quote else "-")
-                    
-                    if snapshot.greeks:
-                        m3.metric("Delta", f"{snapshot.greeks.delta:.2f}")
-                        m4.metric("Gamma", f"{snapshot.greeks.gamma:.2f}")
-                    
-                    # 5-Min Intraday Chart
-                    st.write("### ⚡ Today's 5-Min Interval Chart")
-                    today_str = datetime.now().strftime("%Y-%m-%d")
-                    intraday = client.get_aggs(sym, 5, "minute", today_str, today_str)
-                    
-                    if intraday:
-                        df_chart = pd.DataFrame(intraday)
-                        df_chart['Time'] = pd.to_datetime(df_chart['timestamp'], unit='ms')
-                        st.area_chart(df_chart.set_index('Time')['close'], color="#00FF00")
-                    else:
-                        st.info("No trades in the last few hours.")
-            except Exception as e:
-                st.error(f"Could not load data: {e}")
-
-# ==========================================
-# TAB 2: MAG 7 LIVE SCANNER (Market Wide)
-# ==========================================
-with tab2:
-    st.subheader("🔥 Mag 7 Options Scanner (High Volume)")
+    st.divider()
     
-    col_scan1, col_scan2 = st.columns([1, 4])
+    # Watchlist for Scanner
+    st.header("📡 Scanner Config")
+    tickers = st.multiselect(
+        "Watchlist", 
+        ["NVDA", "TSLA", "AAPL", "AMD", "AMZN", "MSFT", "META", "GOOGL", "SPY", "QQQ", "IWM", "COIN"],
+        default=["NVDA", "TSLA", "AAPL", "AMD", "SPY", "QQQ"]
+    )
+    min_flow = st.number_input("Min Whale Premium ($)", value=25_000, step=5_000)
     
-    with col_scan1:
-        min_prem = st.number_input("Min Premium ($)", value=50000, step=10000)
-        run_scan = st.button("🔄 Scan Market Now")
+    col1, col2 = st.columns(2)
+    start_btn = col1.button("🟢 Start Feed")
+    stop_btn = col2.button("🔴 Stop Feed")
     
-    if run_scan:
-        status = st.status("Scanning Mag 7 Tickers...", expanded=True)
-        all_whales = []
-        progress = status.progress(0)
-        
-        for i, t in enumerate(MAG_7):
-            status.write(f"Scanning {t}...")
-            progress.progress((i+1)/len(MAG_7))
-            
-            try:
-                # Fetch the chain snapshot
-                # This gets the summary of the day so far
-                chain = client.list_snapshot_options_chain(t, params={"limit": 250})
-                
-                for c in chain:
-                    if not c.day or not c.day.volume or not c.day.close:
-                        continue
+    st.divider()
+    st.info("ℹ️ **Tab 1:** Deep dive into specific contracts.\n\nℹ️ **Tab 2:** Watch the live market for Sweeps.")
+
+# --- WEBSOCKET THREAD LOGIC ---
+def run_websocket(key, watchlist, threshold):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except:
+        pass
+
+    def handle_msg(msgs: list[WebSocketMessage]):
+        for m in msgs:
+            if m.event_type == "T":
+                try:
+                    # Filter
+                    found_ticker = next((t for t in watchlist if t in m.symbol), None)
+                    if not found_ticker: continue
+
+                    flow = m.price * m.size * 100
                     
-                    # Filter for active flow
-                    premium = c.day.close * c.day.volume * 100
-                    
-                    if premium >= min_prem:
-                        # Determine Sentiment
-                        side = "BULLISH 🐂" if c.details.contract_type == "call" else "BEARISH 🐻"
+                    if flow >= threshold:
+                        side = "CALL" if "C" in m.symbol else "PUT"
                         
-                        all_whales.append({
-                            "Ticker": t,
-                            "Strike": f"${c.details.strike_price}",
-                            "Expiry": c.details.expiration_date,
-                            "Type": c.details.contract_type.upper(),
-                            "Premium": premium,
-                            "Price": f"${c.day.close}",
-                            "Vol": c.day.volume,
-                            "Sentiment": side
+                        # SWEEP DETECTION (Condition 14)
+                        conditions = m.conditions if hasattr(m, 'conditions') and m.conditions else []
+                        is_sweep = 14 in conditions
+                        tags = "🧹 SWEEP" if is_sweep else "🧱 BLOCK"
+                        
+                        state.data.appendleft({
+                            "Time": time.strftime("%H:%M:%S"),
+                            "Ticker": found_ticker,
+                            "Tags": tags,
+                            "Side": side,
+                            "Price": m.price,
+                            "Size": m.size,
+                            "Flow": flow,
+                            "Symbol": m.symbol
                         })
-                # Sleep to respect rate limits
-                time.sleep(0.1)
-                
-            except Exception as e:
-                pass # Skip errors to keep scanning
-        
-        progress.progress(100)
-        status.update(label="Scan Complete", state="complete", expanded=False)
-        
-        # Display Results
-        if all_whales:
-            df = pd.DataFrame(all_whales)
-            df = df.sort_values(by="Premium", ascending=False)
-            df["Premium"] = df["Premium"].apply(lambda x: f"${x:,.0f}")
-            
-            # Styling
-            def color_row(row):
-                color = '#d4f7d4' if 'BULLISH' in row['Sentiment'] else '#f7d4d4'
-                return [f'background-color: {color}; color: black']*len(row)
+                except: continue
 
-            st.dataframe(
-                df.style.apply(color_row, axis=1),
-                use_container_width=True,
-                height=800
-            )
-        else:
-            st.warning("No significant flow found matching your criteria.")
+    client = WebSocketClient(api_key=key, feed="delayed.polygon.io", market="options", subscriptions=["T.*"], verbose=False)
+    client.run(handle_msg)
+
+# Handle Start/Stop
+if start_btn and not state.running:
+    if not api_key:
+        st.error("Please enter API Key.")
+    else:
+        state.running = True
+        state.thread = threading.Thread(target=run_websocket, args=(api_key, tickers, min_flow), daemon=True)
+        state.thread.start()
+        st.success("Background Scanner Started!")
+
+if stop_btn:
+    state.running = False
+    st.warning("Scanner Paused.")
+
+
+# ==================================================
+# MAIN INTERFACE TABS
+# ==================================================
+tab1, tab2 = st.tabs(["🔍 Contract Inspector", "⚡ Live Whale Stream"])
+
+# --- TAB 1: CONTRACT INSPECTOR (Your "Mag 7" Deep Dive) ---
+with tab1:
+    if not api_key:
+        st.warning("Enter API Key in sidebar to use.")
+    else:
+        client = RESTClient(api_key)
+        c1, c2 = st.columns([1, 3])
+        
+        with c1:
+            st.subheader("1. Select Asset")
+            target_ticker = st.selectbox("Ticker", tickers) # Uses sidebar watchlist
+            
+            # Smart Price Check
+            try:
+                stock = client.get_snapshot_ticker("stocks", target_ticker)
+                cur_price = stock.last_trade.price if stock.last_trade else stock.day.close
+                st.success(f"📍 {target_ticker}: ${cur_price:.2f}")
+            except:
+                cur_price = 0
+                st.warning("Connecting...")
+
+            st.subheader("2. Pick Option")
+            expiry = st.date_input("Expiration", value=datetime.now().date())
+            otype = st.radio("Side", ["Call", "Put"], horizontal=True)
+            type_code = "call" if otype == "Call" else "put"
+            
+            # Smart Strike Fetcher
+            st.write("---")
+            try:
+                contracts = client.list_options_contracts(target_ticker, expiry, type_code, limit=1000)
+                valid_strikes = sorted(list(set([c.strike_price for c in contracts])))
+                
+                if valid_strikes:
+                    def_ix = min(range(len(valid_strikes)), key=lambda i: abs(valid_strikes[i]-cur_price)) if cur_price > 0 else 0
+                    strike = st.selectbox("Strike Price", valid_strikes, index=def_ix)
+                    
+                    # Build Symbol
+                    d_str = expiry.strftime("%y%m%d")
+                    t_char = "C" if otype == "Call" else "P"
+                    s_str = f"{int(strike*1000):08d}"
+                    final_symbol = f"O:{target_ticker}{d_str}{t_char}{s_str}"
+                    
+                    if st.button("Analyze This Contract", type="primary"):
+                        st.session_state['active_symbol'] = final_symbol
+                else:
+                    st.error("No strikes found.")
+            except Exception as e:
+                st.error(f"Error fetching chain: {e}")
+
+        with c2:
+            if 'active_symbol' in st.session_state:
+                sym = st.session_state['active_symbol']
+                st.subheader(f"Analysis: {sym}")
+                
+                try:
+                    snap = client.get_snapshot_option(target_ticker, sym)
+                    if snap:
+                        # Metrics
+                        m1, m2, m3, m4 = st.columns(4)
+                        p = snap.last_trade.price if snap.last_trade else (snap.day.close if snap.day else 0)
+                        v = snap.day.volume if snap.day else 0
+                        
+                        m1.metric("💰 Premium", f"${p}", f"Vol: {v}")
+                        if snap.greeks:
+                            m2.metric("Delta", f"{snap.greeks.delta:.2f}")
+                            m3.metric("Gamma", f"{snap.greeks.gamma:.2f}")
+                            m4.metric("IV", f"{snap.implied_volatility:.2f}")
+                        
+                        # Charts
+                        st.write("### ⚡ Intraday Action (5-Min)")
+                        today = datetime.now().strftime("%Y-%m-%d")
+                        aggs = client.get_aggs(sym, 5, "minute", today, today)
+                        if aggs:
+                            df = pd.DataFrame(aggs)
+                            df['Time'] = pd.to_datetime(df['timestamp'], unit='ms')
+                            st.area_chart(df.set_index('Time')['close'], color="#00FF00")
+                        else:
+                            st.info("No trades yet today.")
+                except Exception as e:
+                    st.error(f"Load failed: {e}")
+
+# --- TAB 2: LIVE WHALE STREAM (The Scanner) ---
+with tab2:
+    st.subheader("🔥 Live Flow: Sweeps & Blocks")
+    
+    feed_placeholder = st.empty()
+    
+    def style_df(df):
+        def color_rows(row):
+            c = '#d4f7d4' if row['Side'] == 'CALL' else '#f7d4d4'
+            if "SWEEP" in row['Tags']:
+                return [f'background-color: {c}; font-weight: bold; border-left: 5px solid #ffcc00'] * len(row)
+            return [f'background-color: {c}; color: black'] * len(row)
+        return df.style.apply(color_rows, axis=1).format({"Flow": "${:,.0f}", "Price": "${:.2f}"})
+
+    # Auto-Refresh Loop for Tab 2
+    if state.running or len(state.data) > 0:
+        if len(state.data) > 0:
+            df = pd.DataFrame(list(state.data))
+            with feed_placeholder.container():
+                st.dataframe(
+                    style_df(df), 
+                    use_container_width=True, 
+                    height=800,
+                    column_config={
+                        "Flow": st.column_config.ProgressColumn("Premium", format="$%f", min_value=0, max_value=max(df["Flow"].max(), 100_000)),
+                        "Tags": st.column_config.TextColumn("Type", help="🧹 = Aggressive Sweep"),
+                    },
+                    hide_index=True
+                )
+        if state.running:
+            time.sleep(1)
+            st.rerun() # Keeps the data fresh
+    else:
+        st.info("Click 'Start Feed' in the sidebar to connect to the market.")
